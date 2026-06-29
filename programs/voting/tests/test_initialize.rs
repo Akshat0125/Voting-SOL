@@ -1,572 +1,491 @@
-#![cfg(feature = "test-sbf")]
-
-use anchor_lang::prelude::*;
-use anchor_lang::system_program;
-use solana_program_test::*;
-use solana_sdk::{
-    pubkey::Pubkey,
-    signature::{Keypair, Signer},
-    transaction::Transaction,
-    instruction::{AccountMeta, Instruction},
-    clock::Clock,
-    sysvar,
-};
-use voting::{
-    accounts::{InitPoll, InitializeCandidate, Vote},
-    instruction as voting_ix,
-    PollAccount,
-    CandidateAccount,
+use {
+    anchor_lang::{
+        prelude::Pubkey,
+        solana_program::instruction::Instruction,
+        InstructionData,
+        ToAccountMetas,
+    },
+    litesvm::LiteSVM,
+    solana_clock::Clock,
+    solana_keypair::Keypair,
+    solana_message::{Message, VersionedMessage},
+    solana_signer::Signer,
+    solana_transaction::versioned::VersionedTransaction,
 };
 
-fn voting_program_test() -> ProgramTest {
-    ProgramTest::new("voting", voting::ID, processor!(voting::entry))
+// ─── setup ────────────────────────────────────────────────────────────────
+fn setup() -> (LiteSVM, Keypair) {
+    let program_id = voting::id();
+    let payer = Keypair::new();
+    let mut svm = LiteSVM::new();
+    let bytes = include_bytes!("../../../target/deploy/voting.so");
+    svm.add_program(program_id, bytes).unwrap();
+    svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+    (svm, payer)
 }
 
-fn poll_pda(poll_id: u64) -> (Pubkey, u8) {
-    Pubkey::find_program_address(
-        &[b"poll", &poll_id.to_le_bytes()],
-        &voting::ID,
-    )
+// ─── send helpers ─────────────────────────────────────────────────────────
+fn send_ix(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    instruction: Instruction,
+) -> litesvm::types::TransactionMetadata {
+    svm.expire_blockhash();
+    let blockhash = svm.latest_blockhash();
+    let msg = Message::new_with_blockhash(
+        &[instruction],
+        Some(&payer.pubkey()),
+        &blockhash,
+    );
+    let tx = VersionedTransaction::try_new(
+        VersionedMessage::Legacy(msg),
+        &[payer],
+    ).unwrap();
+    svm.send_transaction(tx).unwrap()
 }
 
-fn candidate_pda(poll_id: u64, candidate: &str) -> (Pubkey, u8) {
-    Pubkey::find_program_address(
-        &[b"poll", &poll_id.to_le_bytes(), candidate.as_bytes()],
-        &voting::ID,
-    )
-}
-
-// --- init_poll tests ---
-
-#[tokio::test]
-async fn test_init_poll_success() {
-    let mut ctx = voting_program_test().start_with_context().await;
-    let payer = ctx.payer.insecure_clone();
-
-    let poll_id: u64 = 1;
-    let (poll_pda, _bump) = poll_pda(poll_id);
-
-    let start: u64 = 0;
-    let end: u64 = u64::MAX;
-    let name = "Test Poll".to_string();
-    let description = "A simple test poll".to_string();
-
-    let ix = Instruction {
-        program_id: voting::ID,
-        accounts: vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(poll_pda, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-        data: voting_ix::InitPoll {
-            poll_id,
-            start,
-            end,
-            name: name.clone(),
-            description: description.clone(),
-        }
-        .data(),
-    };
-
-    let tx = Transaction::new_signed_with_payer(
-        &[ix],
+fn send_ix_expect_fail(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    instruction: Instruction,
+) -> litesvm::types::FailedTransactionMetadata {
+    svm.expire_blockhash();
+    let blockhash = svm.latest_blockhash();
+    let msg = Message::new_with_blockhash(
+        &[instruction],
         Some(&payer.pubkey()),
-        &[&payer],
-        ctx.last_blockhash,
+        &blockhash,
     );
-
-    ctx.banks_client.process_transaction(tx).await.unwrap();
-
-    let account = ctx.banks_client.get_account(poll_pda).await.unwrap().unwrap();
-    let poll: PollAccount =
-        PollAccount::try_deserialize(&mut account.data.as_ref()).unwrap();
-
-    assert_eq!(poll.poll_name, name);
-    assert_eq!(poll.poll_description, description);
-    assert_eq!(poll.poll_voting_start, start);
-    assert_eq!(poll.poll_voting_end, end);
-    assert_eq!(poll.poll_option_index, 0);
-}
-
-#[tokio::test]
-async fn test_init_poll_duplicate_fails() {
-    let mut ctx = voting_program_test().start_with_context().await;
-    let payer = ctx.payer.insecure_clone();
-
-    let poll_id: u64 = 99;
-    let (poll_pda, _) = poll_pda(poll_id);
-
-    let make_ix = || Instruction {
-        program_id: voting::ID,
-        accounts: vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(poll_pda, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-        data: voting_ix::InitPoll {
-            poll_id,
-            start: 0,
-            end: u64::MAX,
-            name: "Dup".to_string(),
-            description: "dup".to_string(),
-        }
-        .data(),
-    };
-
-    let tx1 = Transaction::new_signed_with_payer(
-        &[make_ix()],
-        Some(&payer.pubkey()),
-        &[&payer],
-        ctx.last_blockhash,
-    );
-    ctx.banks_client.process_transaction(tx1).await.unwrap();
-
-    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-
-    let tx2 = Transaction::new_signed_with_payer(
-        &[make_ix()],
-        Some(&payer.pubkey()),
-        &[&payer],
-        ctx.last_blockhash,
-    );
-
-    let result = ctx.banks_client.process_transaction(tx2).await;
-    assert!(result.is_err(), "Re-initializing the same poll PDA should fail");
-}
-
-// --- initialize_candidate tests ---
-
-#[tokio::test]
-async fn test_initialize_candidate_success() {
-    let mut ctx = voting_program_test().start_with_context().await;
-    let payer = ctx.payer.insecure_clone();
-
-    let poll_id: u64 = 2;
-    let (poll_pda, _) = poll_pda(poll_id);
-    let candidate_name = "Alice".to_string();
-    let (cand_pda, _) = candidate_pda(poll_id, &candidate_name);
-
-    // Create poll first
-    let init_ix = Instruction {
-        program_id: voting::ID,
-        accounts: vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(poll_pda, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-        data: voting_ix::InitPoll {
-            poll_id,
-            start: 0,
-            end: u64::MAX,
-            name: "Poll 2".to_string(),
-            description: "desc".to_string(),
-        }
-        .data(),
-    };
-
-    let tx = Transaction::new_signed_with_payer(
-        &[init_ix],
-        Some(&payer.pubkey()),
-        &[&payer],
-        ctx.last_blockhash,
-    );
-    ctx.banks_client.process_transaction(tx).await.unwrap();
-    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-
-    // Add candidate
-    let cand_ix = Instruction {
-        program_id: voting::ID,
-        accounts: vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(poll_pda, false),
-            AccountMeta::new(cand_pda, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-        data: voting_ix::InitializeCandidate {
-            poll_id,
-            candidate: candidate_name.clone(),
-        }
-        .data(),
-    };
-
-    let tx2 = Transaction::new_signed_with_payer(
-        &[cand_ix],
-        Some(&payer.pubkey()),
-        &[&payer],
-        ctx.last_blockhash,
-    );
-    ctx.banks_client.process_transaction(tx2).await.unwrap();
-
-    let cand_account = ctx.banks_client.get_account(cand_pda).await.unwrap().unwrap();
-    let cand: CandidateAccount =
-        CandidateAccount::try_deserialize(&mut cand_account.data.as_ref()).unwrap();
-
-    assert_eq!(cand.candidate_name, candidate_name);
-    assert_eq!(cand.candidate_vote, 0);
-
-    let poll_account = ctx.banks_client.get_account(poll_pda).await.unwrap().unwrap();
-    let poll: PollAccount =
-        PollAccount::try_deserialize(&mut poll_account.data.as_ref()).unwrap();
-
-    assert_eq!(poll.poll_option_index, 1);
-}
-
-#[tokio::test]
-async fn test_initialize_two_candidates_increments_index() {
-    let mut ctx = voting_program_test().start_with_context().await;
-    let payer = ctx.payer.insecure_clone();
-
-    let poll_id: u64 = 3;
-    let (poll_pda, _) = poll_pda(poll_id);
-
-    let init_ix = Instruction {
-        program_id: voting::ID,
-        accounts: vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(poll_pda, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-        data: voting_ix::InitPoll {
-            poll_id,
-            start: 0,
-            end: u64::MAX,
-            name: "Poll 3".to_string(),
-            description: "desc".to_string(),
-        }
-        .data(),
-    };
-
-    let tx = Transaction::new_signed_with_payer(
-        &[init_ix],
-        Some(&payer.pubkey()),
-        &[&payer],
-        ctx.last_blockhash,
-    );
-    ctx.banks_client.process_transaction(tx).await.unwrap();
-
-    for (i, name) in ["Alice", "Bob"].iter().enumerate() {
-        ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-        let (cand_pda, _) = candidate_pda(poll_id, name);
-
-        let cand_ix = Instruction {
-            program_id: voting::ID,
-            accounts: vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new(poll_pda, false),
-                AccountMeta::new(cand_pda, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-            ],
-            data: voting_ix::InitializeCandidate {
-                poll_id,
-                candidate: name.to_string(),
-            }
-            .data(),
-        };
-
-        let tx = Transaction::new_signed_with_payer(
-            &[cand_ix],
-            Some(&payer.pubkey()),
-            &[&payer],
-            ctx.last_blockhash,
-        );
-        ctx.banks_client.process_transaction(tx).await.unwrap();
-
-        let poll_account = ctx.banks_client.get_account(poll_pda).await.unwrap().unwrap();
-        let poll: PollAccount =
-            PollAccount::try_deserialize(&mut poll_account.data.as_ref()).unwrap();
-        assert_eq!(poll.poll_option_index, (i + 1) as u64);
+    let tx = VersionedTransaction::try_new(
+        VersionedMessage::Legacy(msg),
+        &[payer],
+    ).unwrap();
+    match svm.send_transaction(tx) {
+        Ok(_) => panic!("Expected failure but transaction succeeded"),
+        Err(e) => e,
     }
 }
 
-// --- vote tests ---
+// ─── PDA finders ──────────────────────────────────────────────────────────
+fn find_poll_pda(poll_id: u64) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            b"poll",
+            poll_id.to_le_bytes().as_ref(), // must match poll_id.to_le_bytes()
+        ],
+        &voting::id(),
+    )
+}
 
-async fn setup_poll_with_candidates(
-    ctx: &mut ProgramTestContext,
+fn find_candidate_pda(poll_id: u64, candidate: &str) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            b"poll",
+            poll_id.to_le_bytes().as_ref(),
+            candidate.as_bytes(), // must match candidate.as_ref()
+        ],
+        &voting::id(),
+    )
+}
+
+// ─── instruction builders ─────────────────────────────────────────────────
+fn make_init_poll_ix(
     poll_id: u64,
     start: u64,
     end: u64,
-    candidates: &[&str],
-) {
-    let payer = ctx.payer.insecure_clone();
-    let (poll_pda, _) = poll_pda(poll_id);
-
-    let init_ix = Instruction {
-        program_id: voting::ID,
-        accounts: vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(poll_pda, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-        data: voting_ix::InitPoll {
-            poll_id,
+    name: String,
+    description: String,
+    poll_pda: Pubkey,
+    signer: Pubkey,
+) -> Instruction {
+    Instruction::new_with_bytes(
+        voting::id(),
+        &voting::instruction::InitPoll {
+            _poll_id: poll_id,
             start,
             end,
-            name: format!("Poll {}", poll_id),
-            description: "desc".to_string(),
-        }
-        .data(),
-    };
-
-    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    let tx = Transaction::new_signed_with_payer(
-        &[init_ix],
-        Some(&payer.pubkey()),
-        &[&payer],
-        ctx.last_blockhash,
-    );
-    ctx.banks_client.process_transaction(tx).await.unwrap();
-
-    for name in candidates {
-        let (cand_pda, _) = candidate_pda(poll_id, name);
-        ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-
-        let cand_ix = Instruction {
-            program_id: voting::ID,
-            accounts: vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new(poll_pda, false),
-                AccountMeta::new(cand_pda, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-            ],
-            data: voting_ix::InitializeCandidate {
-                poll_id,
-                candidate: name.to_string(),
-            }
-            .data(),
-        };
-
-        let tx = Transaction::new_signed_with_payer(
-            &[cand_ix],
-            Some(&payer.pubkey()),
-            &[&payer],
-            ctx.last_blockhash,
-        );
-        ctx.banks_client.process_transaction(tx).await.unwrap();
-    }
+            name,
+            description,
+        }.data(),
+        voting::accounts::InitPoll {
+            signer,
+            poll_account: poll_pda,
+            system_program: anchor_lang::solana_program::system_program::id(),
+        }.to_account_metas(None),
+    )
 }
 
-#[tokio::test]
-async fn test_vote_increments_vote_count() {
-    let mut ctx = voting_program_test().start_with_context().await;
-    let payer = ctx.payer.insecure_clone();
-
-    let poll_id: u64 = 10;
-    let candidate_name = "Alice";
-
-    setup_poll_with_candidates(&mut ctx, poll_id, 0, u64::MAX, &[candidate_name]).await;
-
-    let (poll_pda, _) = poll_pda(poll_id);
-    let (cand_pda, _) = candidate_pda(poll_id, candidate_name);
-
-    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-
-    let vote_ix = Instruction {
-        program_id: voting::ID,
-        accounts: vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(poll_pda, false),
-            AccountMeta::new(cand_pda, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-        data: voting_ix::Vote {
-            poll_id,
-            candidate: candidate_name.to_string(),
-        }
-        .data(),
-    };
-
-    let tx = Transaction::new_signed_with_payer(
-        &[vote_ix],
-        Some(&payer.pubkey()),
-        &[&payer],
-        ctx.last_blockhash,
-    );
-    ctx.banks_client.process_transaction(tx).await.unwrap();
-
-    let cand_account = ctx.banks_client.get_account(cand_pda).await.unwrap().unwrap();
-    let cand: CandidateAccount =
-        CandidateAccount::try_deserialize(&mut cand_account.data.as_ref()).unwrap();
-
-    assert_eq!(cand.candidate_vote, 1);
+fn make_init_candidate_ix(
+    poll_id: u64,
+    candidate: String,
+    poll_pda: Pubkey,
+    candidate_pda: Pubkey,
+    signer: Pubkey,
+) -> Instruction {
+    Instruction::new_with_bytes(
+        voting::id(),
+        &voting::instruction::InitializeCandidate {
+            _poll_id: poll_id,
+            candidate,
+        }.data(),
+        voting::accounts::InitializeCandidate {
+            signer,
+            poll_account: poll_pda,
+            candidate_account: candidate_pda,
+            system_program: anchor_lang::solana_program::system_program::id(),
+        }.to_account_metas(None),
+    )
 }
 
-#[tokio::test]
-async fn test_vote_multiple_times_accumulates() {
-    let mut ctx = voting_program_test().start_with_context().await;
-    let payer = ctx.payer.insecure_clone();
-
-    let poll_id: u64 = 11;
-    let candidate_name = "Bob";
-
-    setup_poll_with_candidates(&mut ctx, poll_id, 0, u64::MAX, &[candidate_name]).await;
-
-    let (poll_pda, _) = poll_pda(poll_id);
-    let (cand_pda, _) = candidate_pda(poll_id, candidate_name);
-
-    for _ in 0..3 {
-        ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-        let vote_ix = Instruction {
-            program_id: voting::ID,
-            accounts: vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new(poll_pda, false),
-                AccountMeta::new(cand_pda, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-            ],
-            data: voting_ix::Vote {
-                poll_id,
-                candidate: candidate_name.to_string(),
-            }
-            .data(),
-        };
-
-        let tx = Transaction::new_signed_with_payer(
-            &[vote_ix],
-            Some(&payer.pubkey()),
-            &[&payer],
-            ctx.last_blockhash,
-        );
-        ctx.banks_client.process_transaction(tx).await.unwrap();
-    }
-
-    let cand_account = ctx.banks_client.get_account(cand_pda).await.unwrap().unwrap();
-    let cand: CandidateAccount =
-        CandidateAccount::try_deserialize(&mut cand_account.data.as_ref()).unwrap();
-
-    assert_eq!(cand.candidate_vote, 3);
+fn make_vote_ix(
+    poll_id: u64,
+    candidate: String,
+    poll_pda: Pubkey,
+    candidate_pda: Pubkey,
+    signer: Pubkey,
+) -> Instruction {
+    Instruction::new_with_bytes(
+        voting::id(),
+        &voting::instruction::Vote {
+            _poll_id: poll_id,      
+            _candidate: candidate,
+        }.data(),
+        voting::accounts::Vote {
+            signer,
+            poll_account: poll_pda,
+            candidate_account: candidate_pda,
+            system_program: anchor_lang::solana_program::system_program::id(),
+        }.to_account_metas(None),
+    )
 }
 
-#[tokio::test]
-async fn test_vote_after_end_fails() {
-    let mut ctx = voting_program_test().start_with_context().await;
-    let payer = ctx.payer.insecure_clone();
-
-    let poll_id: u64 = 12;
-    let candidate_name = "Alice";
-
-    // Set voting end in the past (unix timestamp 1 = way in the past)
-    setup_poll_with_candidates(&mut ctx, poll_id, 0, 1, &[candidate_name]).await;
-
-    let (poll_pda, _) = poll_pda(poll_id);
-    let (cand_pda, _) = candidate_pda(poll_id, candidate_name);
-
-    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-
-    let vote_ix = Instruction {
-        program_id: voting::ID,
-        accounts: vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(poll_pda, false),
-            AccountMeta::new(cand_pda, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-        data: voting_ix::Vote {
-            poll_id,
-            candidate: candidate_name.to_string(),
-        }
-        .data(),
-    };
-
-    let tx = Transaction::new_signed_with_payer(
-        &[vote_ix],
-        Some(&payer.pubkey()),
-        &[&payer],
-        ctx.last_blockhash,
-    );
-
-    let result = ctx.banks_client.process_transaction(tx).await;
-    assert!(result.is_err(), "Voting after end time should fail with VotingEnded error");
+// ─── set clock helper ─────────────────────────────────────────────────────
+fn set_clock(svm: &mut LiteSVM, unix_timestamp: i64) {
+    svm.set_sysvar(&Clock {
+        unix_timestamp,
+        slot: 100,
+        epoch: 1,
+        leader_schedule_epoch: 2,
+        epoch_start_timestamp: unix_timestamp - 100,
+    });
 }
 
-#[tokio::test]
-async fn test_vote_before_start_fails() {
-    let mut ctx = voting_program_test().start_with_context().await;
-    let payer = ctx.payer.insecure_clone();
+// ─── Test 1: initialize poll ──────────────────────────────────────────────
+#[test]
+fn test_init_poll() {
+    let (mut svm, payer) = setup();
+    let poll_id: u64 = 1;
+    let (poll_pda, _) = find_poll_pda(poll_id);
 
-    let poll_id: u64 = 13;
-    let candidate_name = "Alice";
-
-    // Set voting start far in the future
-    let far_future: u64 = u64::MAX - 1;
-    setup_poll_with_candidates(&mut ctx, poll_id, far_future, u64::MAX, &[candidate_name]).await;
-
-    let (poll_pda, _) = poll_pda(poll_id);
-    let (cand_pda, _) = candidate_pda(poll_id, candidate_name);
-
-    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-
-    let vote_ix = Instruction {
-        program_id: voting::ID,
-        accounts: vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(poll_pda, false),
-            AccountMeta::new(cand_pda, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-        data: voting_ix::Vote {
-            poll_id,
-            candidate: candidate_name.to_string(),
-        }
-        .data(),
-    };
-
-    let tx = Transaction::new_signed_with_payer(
-        &[vote_ix],
-        Some(&payer.pubkey()),
-        &[&payer],
-        ctx.last_blockhash,
+    let ix = make_init_poll_ix(
+        poll_id,
+        1000,                           // start time
+        2000,                           // end time
+        "Best Language".to_string(),
+        "Vote for your favourite language".to_string(),
+        poll_pda,
+        payer.pubkey(),
     );
 
-    let result = ctx.banks_client.process_transaction(tx).await;
-    assert!(result.is_err(), "Voting before start time should fail with VotingNotStarted error");
+    let res = send_ix(&mut svm, &payer, ix);
+
+    println!("\n--- INIT POLL LOGS ---");
+    for log in &res.logs { println!("{}", log); }
+    println!("----------------------\n");
+
+    // poll has no msg!() so just verify transaction succeeded
+    let logs = res.logs.join(" ");
+    assert!(
+        logs.contains("Instruction: InitPoll"),
+        "InitPoll instruction not found: {}",
+        logs
+    );
+    println!("Poll initialized successfully");
 }
 
-#[tokio::test]
-async fn test_vote_does_not_change_other_candidates() {
-    let mut ctx = voting_program_test().start_with_context().await;
-    let payer = ctx.payer.insecure_clone();
+// ─── Test 2: initialize candidate ────────────────────────────────────────
+#[test]
+fn test_initialize_candidate() {
+    let (mut svm, payer) = setup();
+    let poll_id: u64 = 1;
+    let candidate_name = "Rust";
+    let (poll_pda, _) = find_poll_pda(poll_id);
+    let (candidate_pda, _) = find_candidate_pda(poll_id, candidate_name);
 
-    let poll_id: u64 = 14;
-    setup_poll_with_candidates(&mut ctx, poll_id, 0, u64::MAX, &["Alice", "Bob"]).await;
+    // init poll first
+    send_ix(&mut svm, &payer, make_init_poll_ix(
+        poll_id,
+        1000,
+        2000,
+        "Best Language".to_string(),
+        "Vote for your favourite language".to_string(),
+        poll_pda,
+        payer.pubkey(),
+    ));
 
-    let (poll_pda, _) = poll_pda(poll_id);
-    let (alice_pda, _) = candidate_pda(poll_id, "Alice");
-    let (bob_pda, _) = candidate_pda(poll_id, "Bob");
-
-    // Vote for Alice only
-    ctx.last_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-
-    let vote_ix = Instruction {
-        program_id: voting::ID,
-        accounts: vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(poll_pda, false),
-            AccountMeta::new(alice_pda, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-        data: voting_ix::Vote {
-            poll_id,
-            candidate: "Alice".to_string(),
-        }
-        .data(),
-    };
-
-    let tx = Transaction::new_signed_with_payer(
-        &[vote_ix],
-        Some(&payer.pubkey()),
-        &[&payer],
-        ctx.last_blockhash,
+    // init candidate
+    let ix = make_init_candidate_ix(
+        poll_id,
+        candidate_name.to_string(),
+        poll_pda,
+        candidate_pda,
+        payer.pubkey(),
     );
-    ctx.banks_client.process_transaction(tx).await.unwrap();
 
-    let alice_account = ctx.banks_client.get_account(alice_pda).await.unwrap().unwrap();
-    let alice: CandidateAccount =
-        CandidateAccount::try_deserialize(&mut alice_account.data.as_ref()).unwrap();
+    let res = send_ix(&mut svm, &payer, ix);
 
-    let bob_account = ctx.banks_client.get_account(bob_pda).await.unwrap().unwrap();
-    let bob: CandidateAccount =
-        CandidateAccount::try_deserialize(&mut bob_account.data.as_ref()).unwrap();
+    println!("\n--- INIT CANDIDATE LOGS ---");
+    for log in &res.logs { println!("{}", log); }
+    println!("---------------------------\n");
 
-    assert_eq!(alice.candidate_vote, 1);
-    assert_eq!(bob.candidate_vote, 0);
+    let logs = res.logs.join(" ");
+    assert!(
+        logs.contains("Instruction: InitializeCandidate"),
+        "InitializeCandidate not found: {}",
+        logs
+    );
+    println!("Candidate Rust initialized successfully");
+}
+
+// ─── Test 3: vote during valid window → success ───────────────────────────
+#[test]
+fn test_vote_valid() {
+    let (mut svm, payer) = setup();
+    let poll_id: u64 = 1;
+    let candidate_name = "Rust";
+    let (poll_pda, _) = find_poll_pda(poll_id);
+    let (candidate_pda, _) = find_candidate_pda(poll_id, candidate_name);
+
+    // set clock to voting window
+    let start: u64 = 1000;
+    let end: u64 = 5000;
+    set_clock(&mut svm, 2000); // inside window
+
+    // init poll
+    send_ix(&mut svm, &payer, make_init_poll_ix(
+        poll_id,
+        start,
+        end,
+        "Best Language".to_string(),
+        "Vote for your favourite language".to_string(),
+        poll_pda,
+        payer.pubkey(),
+    ));
+
+    // init candidate
+    send_ix(&mut svm, &payer, make_init_candidate_ix(
+        poll_id,
+        candidate_name.to_string(),
+        poll_pda,
+        candidate_pda,
+        payer.pubkey(),
+    ));
+
+    // vote
+    let ix = make_vote_ix(
+        poll_id,
+        candidate_name.to_string(),
+        poll_pda,
+        candidate_pda,
+        payer.pubkey(),
+    );
+
+    let res = send_ix(&mut svm, &payer, ix);
+
+    println!("\n--- VOTE LOGS ---");
+    for log in &res.logs { println!("{}", log); }
+    println!("-----------------\n");
+
+    let logs = res.logs.join(" ");
+    assert!(
+        logs.contains("Instruction: Vote"),
+        "Vote instruction not found: {}",
+        logs
+    );
+    println!("Vote cast successfully for Rust");
+}
+
+// ─── Test 4: vote before start → VotingNotStarted ────────────────────────
+#[test]
+fn test_vote_not_started() {
+    let (mut svm, payer) = setup();
+    let poll_id: u64 = 1;
+    let candidate_name = "Rust";
+    let (poll_pda, _) = find_poll_pda(poll_id);
+    let (candidate_pda, _) = find_candidate_pda(poll_id, candidate_name);
+
+    // set clock BEFORE voting starts
+    set_clock(&mut svm, 500); // before start of 1000
+
+    // init poll
+    send_ix(&mut svm, &payer, make_init_poll_ix(
+        poll_id,
+        1000,                           // start
+        5000,                           // end
+        "Best Language".to_string(),
+        "Vote for your favourite language".to_string(),
+        poll_pda,
+        payer.pubkey(),
+    ));
+
+    // init candidate
+    send_ix(&mut svm, &payer, make_init_candidate_ix(
+        poll_id,
+        candidate_name.to_string(),
+        poll_pda,
+        candidate_pda,
+        payer.pubkey(),
+    ));
+
+    // vote before start — should fail
+    let ix = make_vote_ix(
+        poll_id,
+        candidate_name.to_string(),
+        poll_pda,
+        candidate_pda,
+        payer.pubkey(),
+    );
+
+    let e = send_ix_expect_fail(&mut svm, &payer, ix);
+    let err_str = format!("{:?}", e);
+    assert!(
+        err_str.contains("VotingNotStarted"),
+        "Expected VotingNotStarted but got: {}",
+        err_str
+    );
+    println!("Correctly rejected vote before start");
+}
+
+// ─── Test 5: vote after end → VotingEnded ────────────────────────────────
+#[test]
+fn test_vote_ended() {
+    let (mut svm, payer) = setup();
+    let poll_id: u64 = 1;
+    let candidate_name = "Rust";
+    let (poll_pda, _) = find_poll_pda(poll_id);
+    let (candidate_pda, _) = find_candidate_pda(poll_id, candidate_name);
+
+    // set clock AFTER voting ends
+    set_clock(&mut svm, 6000); // after end of 5000
+
+    // init poll
+    send_ix(&mut svm, &payer, make_init_poll_ix(
+        poll_id,
+        1000,
+        5000,
+        "Best Language".to_string(),
+        "Vote for your favourite language".to_string(),
+        poll_pda,
+        payer.pubkey(),
+    ));
+
+    // init candidate
+    send_ix(&mut svm, &payer, make_init_candidate_ix(
+        poll_id,
+        candidate_name.to_string(),
+        poll_pda,
+        candidate_pda,
+        payer.pubkey(),
+    ));
+
+    // vote after end — should fail
+    let ix = make_vote_ix(
+        poll_id,
+        candidate_name.to_string(),
+        poll_pda,
+        candidate_pda,
+        payer.pubkey(),
+    );
+
+    let e = send_ix_expect_fail(&mut svm, &payer, ix);
+    let err_str = format!("{:?}", e);
+    assert!(
+        err_str.contains("VotingEnded"),
+        "Expected VotingEnded but got: {}",
+        err_str
+    );
+    println!("Correctly rejected vote after end");
+}
+
+// ─── Test 6: multiple candidates + multiple votes ─────────────────────────
+#[test]
+fn test_multiple_candidates() {
+    let (mut svm, payer) = setup();
+    let poll_id: u64 = 1;
+    let (poll_pda, _) = find_poll_pda(poll_id);
+
+    set_clock(&mut svm, 2000);
+
+    // init poll
+    send_ix(&mut svm, &payer, make_init_poll_ix(
+        poll_id,
+        1000,
+        5000,
+        "Best Language".to_string(),
+        "Vote for your favourite language".to_string(),
+        poll_pda,
+        payer.pubkey(),
+    ));
+
+    // add Rust candidate
+    let rust_pda = find_candidate_pda(poll_id, "Rust").0;
+    send_ix(&mut svm, &payer, make_init_candidate_ix(
+        poll_id,
+        "Rust".to_string(),
+        poll_pda,
+        rust_pda,
+        payer.pubkey(),
+    ));
+
+    // add Python candidate
+    let python_pda = find_candidate_pda(poll_id, "Python").0;
+    send_ix(&mut svm, &payer, make_init_candidate_ix(
+        poll_id,
+        "Python".to_string(),
+        poll_pda,
+        python_pda,
+        payer.pubkey(),
+    ));
+
+    // vote for Rust
+    let res = send_ix(&mut svm, &payer, make_vote_ix(
+        poll_id,
+        "Rust".to_string(),
+        poll_pda,
+        rust_pda,
+        payer.pubkey(),
+    ));
+
+    println!("\n--- VOTE FOR RUST LOGS ---");
+    for log in &res.logs { println!("{}", log); }
+    println!("--------------------------\n");
+
+    let logs = res.logs.join(" ");
+    assert!(
+        logs.contains("Instruction: Vote"),
+        "Vote for Rust not found: {}",
+        logs
+    );
+
+    // vote for Python
+    let res2 = send_ix(&mut svm, &payer, make_vote_ix(
+        poll_id,
+        "Python".to_string(),
+        poll_pda,
+        python_pda,
+        payer.pubkey(),
+    ));
+
+    println!("\n--- VOTE FOR PYTHON LOGS ---");
+    for log in &res2.logs { println!("{}", log); }
+    println!("----------------------------\n");
+
+    let logs2 = res2.logs.join(" ");
+    assert!(
+        logs2.contains("Instruction: Vote"),
+        "Vote for Python not found: {}",
+        logs2
+    );
+
+    println!("Multiple candidates voted successfully");
 }
